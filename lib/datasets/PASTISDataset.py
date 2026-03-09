@@ -1,10 +1,16 @@
 """
 Author: Vivien Sainte Fare Garnot (github.com/VSainteuf)
 License MIT
+
+Extended by: RESTORE-DiT team
+Extension: Added optional Gaofen-1 (GF-1) satellite support as a third modality.
+           All existing Sentinel-1 / Sentinel-2 behavior is fully preserved.
+           GF-1 is loaded only when `use_gaofen1=True` is passed to the constructor.
 """
 
 import json
 import os
+import warnings
 from datetime import datetime
 
 import geopandas as gpd
@@ -15,6 +21,20 @@ import torch.utils.data as tdata
 from torchvision import transforms
 from typing import Any, Dict, List, Optional, Tuple
 from omegaconf import DictConfig, ListConfig, OmegaConf
+
+# ── Gaofen-1 sensor constants ──────────────────────────────────────────────────
+# GF-1 PMS and WFV sensors carry 4 multispectral bands in order:
+#   Band 1 (Blue)  : 0.45–0.52 μm
+#   Band 2 (Green) : 0.52–0.59 μm
+#   Band 3 (Red)   : 0.63–0.69 μm
+#   Band 4 (NIR)   : 0.77–0.89 μm
+GF1_DEFAULT_CHANNELS = 4
+
+# Normalization ceiling for GF-1 surface reflectance (×10000 convention).
+# Typical non-snow land reflectance: < 0.30  →  DN < 3000.
+# If your pipeline stores raw 12-bit DN (0–4095), set gaofen1_norm_max=4095.
+# If ToA reflectance can exceed 0.30, increase accordingly (e.g. 10000).
+GF1_DEFAULT_NORM_MAX = 3000.0
 
 
 class PASTISDataset(tdata.Dataset):
@@ -41,6 +61,13 @@ class PASTISDataset(tdata.Dataset):
         mono_date=None,
         sats=["S2"],
         date_rescale=False,
+        # ── Gaofen-1 extension (new parameters) ────────────────────────────
+        # All parameters below are additive; they do not affect existing behavior
+        # when left at their default values (use_gaofen1=False).
+        use_gaofen1: bool = False,
+        gaofen1_root: Optional[str] = None,
+        gaofen1_channels: int = GF1_DEFAULT_CHANNELS,
+        gaofen1_norm_max: float = GF1_DEFAULT_NORM_MAX,
     ):
         """
         Pytorch Dataset class to load samples from the PASTIS dataset, for semantic and
@@ -226,6 +253,26 @@ class PASTISDataset(tdata.Dataset):
             self.c_index_nir = torch.Tensor([6]).long()
         else:
             self.c_index_nir = torch.from_numpy(np.array(np.nan))
+
+        # ── Gaofen-1 (GF-1) extension ─────────────────────────────────────────
+        # GF-1 is handled entirely outside the `sats` loop because:
+        #   1. It is an optical sensor (not SAR), with different normalization.
+        #   2. It may have no temporal metadata aligned with PASTIS date tables.
+        #   3. It is treated as a single-acquisition context image per patch.
+        # The existing S1/S2 code path is completely untouched.
+        self.use_gaofen1 = use_gaofen1
+        # Default path follows the PASTIS naming convention: <root>/DATA_GF1/GF1_<patch_id>.npy
+        self.gaofen1_root = gaofen1_root or os.path.join(root, "DATA_GF1")
+        self.gaofen1_channels = gaofen1_channels
+        self.gaofen1_norm_max = gaofen1_norm_max
+        if use_gaofen1:
+            print(f"[GF1] Gaofen-1 support enabled. Looking for data in: {self.gaofen1_root}")
+            if not os.path.isdir(self.gaofen1_root):
+                warnings.warn(
+                    f"[GF1] Data directory not found: {self.gaofen1_root}. "
+                    "GF-1 tiles will return zeros for missing patches.",
+                    UserWarning,
+                )
 
         print("Dataset ready.")
 
@@ -441,6 +488,15 @@ class PASTISDataset(tdata.Dataset):
             dates['S2'] = ((dates['S2'] / 10).round() * 10).int()
             # print(dates['S2'])
 
+        # ── Gaofen-1 (optional, loaded outside the sats loop) ─────────────────
+        # We always include the key so pad_collate sees a consistent schema.
+        # When use_gaofen1=False: key is absent (callers that don't know about GF-1
+        # are unaffected).
+        # When use_gaofen1=True but the file is missing: zeros tensor is returned
+        # and 'gf1_valid' is set to False so downstream code can skip the sample.
+        if self.use_gaofen1:
+            gaofen1, gf1_valid = self._load_gaofen1(id_patch)
+
         # Assemble output
         out = {
             'x': frames_input,
@@ -456,6 +512,13 @@ class PASTISDataset(tdata.Dataset):
             'c_index_nir': self.c_index_nir,
             'cloud_mask': cloud_mask,
         }
+
+        # Add GF-1 keys only when the modality is requested.
+        # Keeping them absent when not requested preserves full backward compatibility
+        # with all existing training/inference scripts.
+        if self.use_gaofen1:
+            out['gaofen1'] = gaofen1          # (C, H, W) float32 tensor
+            out['gf1_valid'] = gf1_valid       # bool: False → file was missing/invalid
 
         return out
 
@@ -507,6 +570,131 @@ class PASTISDataset(tdata.Dataset):
             t_sampled = t_sampled[t_start:t_end]
 
         return t_sampled
+
+    # ── Gaofen-1 helper ───────────────────────────────────────────────────────
+
+    def _load_gaofen1(self, id_patch: int) -> Tuple[torch.Tensor, bool]:
+        """
+        Load and normalise Gaofen-1 data for one PASTIS patch.
+
+        Expected file layout (mirrors the PASTIS DATA_* convention):
+            <gaofen1_root>/GF1_<id_patch>.npy
+            Shape: (C, H, W)  – single acquisition, or
+                   (T, C, H, W) – short time series
+
+        Normalisation (optical sensor, same philosophy as S2):
+            1. Replace NaN → 0
+            2. Clamp to [0, gaofen1_norm_max]
+            3. Divide by gaofen1_norm_max  →  [0, 1]
+            4. If self.rescale=True: apply Normalize([0.5],[0.5])  →  [-1, 1]
+
+        Sanity checks performed:
+            • File existence
+            • Array dimensionality (must be 3-D or 4-D)
+            • Channel count must match self.gaofen1_channels
+            • Spatial size must match self.image_size
+            • All-NaN tile detection
+
+        Returns:
+            (tensor, valid):
+                tensor – float32 Tensor ready for model consumption;
+                         zeros of shape (gaofen1_channels, H, W) when invalid.
+                valid  – True iff the file was loaded successfully.
+        """
+        gf1_path = os.path.join(self.gaofen1_root, f"GF1_{id_patch}.npy")
+        H_exp, W_exp = self.image_size
+
+        def _zeros():
+            """Return a zero tensor with the expected GF-1 shape."""
+            return torch.zeros(self.gaofen1_channels, H_exp, W_exp, dtype=torch.float32)
+
+        # ── Sanity check 1: file existence ───────────────────────────────────
+        if not os.path.isfile(gf1_path):
+            warnings.warn(
+                f"[GF1] Missing file for patch {id_patch}: {gf1_path}. "
+                "Returning zero tensor (gf1_valid=False).",
+                UserWarning,
+            )
+            return _zeros(), False
+
+        # ── Load ──────────────────────────────────────────────────────────────
+        try:
+            gf1_np = np.load(gf1_path).astype(np.float32)
+        except Exception as exc:
+            warnings.warn(
+                f"[GF1] Failed to load {gf1_path}: {exc}. "
+                "Returning zero tensor (gf1_valid=False).",
+                UserWarning,
+            )
+            return _zeros(), False
+
+        gf1 = torch.from_numpy(gf1_np)
+
+        # ── Sanity check 2: dimensionality ───────────────────────────────────
+        if gf1.ndim == 3:
+            C, H, W = gf1.shape            # single acquisition (C, H, W)
+        elif gf1.ndim == 4:
+            _T, C, H, W = gf1.shape        # short time series  (T, C, H, W)
+            # Use only the first frame for now; extend here for full series support
+            gf1 = gf1[0]
+        else:
+            raise ValueError(
+                f"[GF1] Patch {id_patch}: unexpected array shape {tuple(gf1.shape)}. "
+                f"Expected (C, H, W) or (T, C, H, W). File: {gf1_path}"
+            )
+
+        # ── Sanity check 3: channel count ─────────────────────────────────────
+        if C != self.gaofen1_channels:
+            raise ValueError(
+                f"[GF1] Patch {id_patch}: channel mismatch. "
+                f"Expected {self.gaofen1_channels} channels, got {C}. "
+                f"File: {gf1_path}"
+            )
+
+        # ── Sanity check 4: spatial size matches S2 tiles ─────────────────────
+        if H != H_exp or W != W_exp:
+            raise ValueError(
+                f"[GF1] Patch {id_patch}: spatial size mismatch with S2. "
+                f"Expected ({H_exp}, {W_exp}), got ({H}, {W}). "
+                f"Ensure GF-1 tiles are co-registered and resampled to the same grid. "
+                f"File: {gf1_path}"
+            )
+
+        # ── Sanity check 5: all-NaN tile ──────────────────────────────────────
+        if torch.isnan(gf1).all():
+            warnings.warn(
+                f"[GF1] Patch {id_patch}: tile is entirely NaN. "
+                "Returning zero tensor (gf1_valid=False).",
+                UserWarning,
+            )
+            return _zeros(), False
+
+        # Warn (but do not discard) for all-zero tiles – may be valid no-data
+        if (gf1 == 0).all():
+            warnings.warn(
+                f"[GF1] Patch {id_patch}: tile is entirely zero. "
+                "This may indicate a no-data region. Proceeding with caution.",
+                UserWarning,
+            )
+
+        # ── Replace residual NaNs with 0 before arithmetic ────────────────────
+        gf1 = torch.nan_to_num(gf1, nan=0.0)
+
+        # ── Normalisation ─────────────────────────────────────────────────────
+        # Mirrors the S2 normalisation style:
+        #   clamp to valid range → divide to get [0, 1]
+        # Assumption: GF-1 DN represents surface reflectance × 10000.
+        #   Typical land: refl < 0.30  →  DN < 3000  (default gaofen1_norm_max).
+        #   Adjust gaofen1_norm_max via config if your preprocessing differs.
+        gf1 = torch.clamp(gf1, 0.0, self.gaofen1_norm_max) / self.gaofen1_norm_max
+
+        # Optional rescale to [-1, 1] – same treatment as S2 when self.rescale=True
+        if self.rescale:
+            gf1 = transforms.Normalize([0.5], [0.5])(gf1)
+
+        return gf1, True
+
+    # ── End Gaofen-1 helper ───────────────────────────────────────────────────
 
     def select_random_frames(self, mask, num_frames):
         T = mask.shape[0]

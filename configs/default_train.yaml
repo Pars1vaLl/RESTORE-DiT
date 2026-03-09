@@ -12,6 +12,32 @@ data:                                      # See lib/datasets/EarthNet2021Datase
 #    render_occluded_above_p: 0.9           # Minimum cloud cover [-] to fully mask an input image. Set to None to keep original cloud masks.
 #    return_cloud_mask: true                # Set to True if metrics/masked_metrics is True.
 
+    # ── Gaofen-1 extension (PASTISDataset) ─────────────────────────────────
+    # These keys are silently ignored when using the original PASTIS pipeline
+    # without Gaofen-1 data.  Set use_gaofen1: true to activate.
+    use_gaofen1: false            # Toggle GF-1 modality on/off without code changes.
+    gaofen1_root: null            # Absolute path to GF-1 tile folder.
+                                  # null → defaults to <root>/DATA_GF1/
+    gaofen1_channels: 4           # GF-1 band count: Blue, Green, Red, NIR
+    gaofen1_norm_max: 3000.0      # Normalisation ceiling for GF-1 DN values.
+                                  # Assumption: surface reflectance × 10000,
+                                  # typical non-snow land < 3000.
+                                  # Use 4095 for raw 12-bit DN; 10000 for full range.
+
+    # ── MultiModalDataset config (use dataset: multimodal) ─────────────────
+    # Uncomment and adjust when switching from PASTISDataset to MultiModalDataset.
+    # dataset: multimodal
+    # manifest_path: /path/to/manifest.csv
+    # use_s1: true
+    # use_gaofen1: false
+    # s2_norm_max: 10000.0
+    # gf1_norm_max: 3000.0
+    # s1_norm_stats_path: null      # Optional JSON with per-channel mean/std
+    # s1_input_db: false            # True if S1 values are stored in dB
+    # tile_size: [256, 256]         # Expected H × W for all modality tiles
+    # gf1_expected_channels: 4      # Must match actual GF-1 band count
+    # return_paths: true            # Include file paths in meta dict
+
 mask:
     mask_type: random_clouds               # Mask the input time series with randomly sampled cloud masks or the actual cloud masks. ['random_clouds', 'real_clouds']
     ratio_masked_frames: 0.5               # Ratio of partially/fully masked images per image time series (upper bound).
